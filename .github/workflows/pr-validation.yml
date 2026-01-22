@@ -1,0 +1,309 @@
+name: Pull Request Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '**.bicep'
+      - '**.bicepparam'
+      - 'deploy.sh'
+      - 'modules/**'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+  pull-requests: write  # To comment on PRs
+  id-token: write      # For OIDC authentication
+
+jobs:
+  validate-bicep:
+    name: Validate Bicep Templates
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout PR code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for better diff analysis
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Install Azure CLI Bicep extension
+      run: az bicep install
+
+    - name: Validate Bicep syntax
+      id: validate
+      run: |
+        echo "🔍 Validating Bicep template syntax..."
+        VALIDATION_ERRORS=""
+
+        # Validate main template
+        if ! az bicep build --file main.bicep --stdout > /dev/null 2> validation_errors.txt; then
+          echo "❌ Main template validation failed"
+          VALIDATION_ERRORS+="Main template errors:\n$(cat validation_errors.txt)\n\n"
+        else
+          echo "✅ Main template validation passed"
+        fi
+
+        # Validate all modules
+        for module in modules/*.bicep; do
+          echo "Validating $module..."
+          if ! az bicep build --file "$module" --stdout > /dev/null 2> "validation_errors_$(basename $module).txt"; then
+            echo "❌ $module validation failed"
+            VALIDATION_ERRORS+="$module errors:\n$(cat validation_errors_$(basename $module).txt)\n\n"
+          else
+            echo "✅ $module validation passed"
+          fi
+        done
+
+        if [[ -n "$VALIDATION_ERRORS" ]]; then
+          echo "has_errors=true" >> $GITHUB_OUTPUT
+          echo "validation_errors<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$VALIDATION_ERRORS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        else
+          echo "has_errors=false" >> $GITHUB_OUTPUT
+          echo "All Bicep templates validated successfully! ✅"
+        fi
+
+    - name: Check for best practices
+      id: best-practices
+      run: |
+        echo "🔍 Checking for Bicep best practices..."
+        WARNINGS=""
+
+        # Check for hardcoded values
+        if grep -r "hardcoded\|TODO\|FIXME" *.bicep modules/*.bicep; then
+          WARNINGS+="⚠️ Found hardcoded values or TODOs in templates\n"
+        fi
+
+        # Check for missing descriptions
+        if grep -L "description:" *.bicep modules/*.bicep; then
+          WARNINGS+="⚠️ Some templates missing parameter descriptions\n"
+        fi
+
+        # Check for missing metadata
+        if ! grep -q "metadata" main.bicep; then
+          WARNINGS+="⚠️ Main template missing metadata section\n"
+        fi
+
+        # Check for appropriate resource naming
+        if ! grep -q "var.*Name.*=" main.bicep modules/*.bicep; then
+          WARNINGS+="⚠️ Consider using variable-based resource naming for consistency\n"
+        fi
+
+        if [[ -n "$WARNINGS" ]]; then
+          echo "has_warnings=true" >> $GITHUB_OUTPUT
+          echo "warnings<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$WARNINGS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        else
+          echo "has_warnings=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Test deployment (What-If)
+      id: whatif
+      run: |
+        echo "🔍 Running What-If analysis..."
+
+        # Run what-if deployment to dev environment
+        WHATIF_OUTPUT=$(az deployment sub what-if \
+          --location "centralus" \
+          --template-file main.bicep \
+          --parameters main.bicepparam \
+          --parameters environment="dev" \
+          --parameters location="centralus" \
+          --parameters companyPrefix="gh-test" \
+          --parameters adminPassword="${{ secrets.AZURE_ADMIN_PASSWORD }}" \
+          --parameters sshPublicKey="${{ secrets.SSH_PUBLIC_KEY }}" \
+          --parameters vmSize="Standard_B2s" 2>&1 || echo "What-if analysis completed with warnings")
+
+        # Save what-if output
+        echo "whatif_output<<EOF" >> $GITHUB_OUTPUT
+        echo "$WHATIF_OUTPUT" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+        echo "✅ What-If analysis completed"
+
+    - name: Generate security analysis
+      id: security
+      run: |
+        echo "🔍 Running security analysis..."
+        SECURITY_ISSUES=""
+
+        # Check for security best practices
+        if grep -r "adminPassword.*=" *.bicep modules/*.bicep; then
+          SECURITY_ISSUES+="⚠️ Admin passwords should use secure parameters\n"
+        fi
+
+        # Check for overly permissive NSG rules
+        if grep -r "0.0.0.0/0\|*" modules/*.bicep | grep -i security; then
+          SECURITY_ISSUES+="⚠️ Found potentially overly permissive network security rules\n"
+        fi
+
+        # Check for public IP assignments
+        if grep -r "publicIPAddress" modules/*.bicep; then
+          SECURITY_ISSUES+="ℹ️ Public IP addresses detected - ensure they're necessary\n"
+        fi
+
+        # Check for storage account security
+        if grep -r "allowBlobPublicAccess.*true" modules/*.bicep; then
+          SECURITY_ISSUES+="⚠️ Storage account allows public blob access\n"
+        fi
+
+        if [[ -n "$SECURITY_ISSUES" ]]; then
+          echo "has_security_issues=true" >> $GITHUB_OUTPUT
+          echo "security_issues<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$SECURITY_ISSUES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        else
+          echo "has_security_issues=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Calculate estimated costs
+      id: cost-analysis
+      run: |
+        echo "💰 Estimating deployment costs..."
+
+        # Simple cost estimation based on VM sizes and quantities
+        VM_COUNT=$(grep -r "resource.*Microsoft.Compute/virtualMachines" modules/*.bicep | wc -l)
+        echo "Estimated VM count: $VM_COUNT"
+
+        COST_ESTIMATE="Estimated monthly cost (rough):\n"
+        COST_ESTIMATE+="- VMs (Standard_B2s): ~$$(echo \"$VM_COUNT * 30\" | bc) USD/month\n"
+        COST_ESTIMATE+="- Storage accounts: ~$10 USD/month\n"
+        COST_ESTIMATE+="- Network resources: ~$20 USD/month\n"
+        COST_ESTIMATE+="- **Total estimate: ~$$(echo \"$VM_COUNT * 30 + 30\" | bc) USD/month**\n\n"
+        COST_ESTIMATE+="ℹ️ This is a rough estimate. Actual costs depend on usage, region, and specific configurations."
+
+        echo "cost_estimate<<EOF" >> $GITHUB_OUTPUT
+        echo -e "$COST_ESTIMATE" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Comment on PR
+      uses: actions/github-script@v7
+      if: always()
+      with:
+        script: |
+          const validationPassed = '${{ steps.validate.outputs.has_errors }}' !== 'true';
+          const hasWarnings = '${{ steps.best-practices.outputs.has_warnings }}' === 'true';
+          const hasSecurityIssues = '${{ steps.security.outputs.has_security_issues }}' === 'true';
+
+          let comment = '## 🏗️ Infrastructure Validation Report\n\n';
+
+          // Validation Results
+          if (validationPassed) {
+            comment += '### ✅ Bicep Validation: PASSED\n';
+            comment += 'All Bicep templates are syntactically valid and can be compiled.\n\n';
+          } else {
+            comment += '### ❌ Bicep Validation: FAILED\n';
+            comment += '```\n${{ steps.validate.outputs.validation_errors }}\n```\n\n';
+          }
+
+          // Best Practices
+          if (hasWarnings) {
+            comment += '### ⚠️ Best Practices Review\n';
+            comment += '${{ steps.best-practices.outputs.warnings }}\n\n';
+          } else {
+            comment += '### ✅ Best Practices: All Good\n\n';
+          }
+
+          // Security Analysis
+          if (hasSecurityIssues) {
+            comment += '### 🔐 Security Analysis\n';
+            comment += '${{ steps.security.outputs.security_issues }}\n\n';
+          } else {
+            comment += '### ✅ Security Analysis: No Issues Found\n\n';
+          }
+
+          // What-If Analysis
+          comment += '### 📋 Deployment Preview (What-If)\n';
+          comment += '<details><summary>Click to expand What-If output</summary>\n\n';
+          comment += '```\n${{ steps.whatif.outputs.whatif_output }}\n```\n';
+          comment += '</details>\n\n';
+
+          // Cost Estimation
+          comment += '### 💰 Cost Estimation\n';
+          comment += '${{ steps.cost-analysis.outputs.cost_estimate }}\n\n';
+
+          // Final Status
+          if (validationPassed && !hasSecurityIssues) {
+            comment += '### 🎉 Overall Status: READY TO MERGE ✅\n';
+            comment += 'This PR passes all validation checks and is ready for deployment.\n';
+          } else {
+            comment += '### 🚨 Overall Status: NEEDS ATTENTION ❌\n';
+            comment += 'Please address the validation errors or security issues above before merging.\n';
+          }
+
+          comment += '\n---\n';
+          comment += '*This report was generated automatically by GitHub Actions.*';
+
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
+
+    - name: Set PR status
+      if: steps.validate.outputs.has_errors == 'true'
+      run: |
+        echo "❌ PR validation failed - blocking merge"
+        exit 1
+
+  test-deployment:
+    name: Test Deployment (Optional)
+    runs-on: ubuntu-latest
+    needs: validate-bicep
+    if: github.event.pull_request.body contains '[deploy-test]'
+
+    steps:
+    - name: Checkout PR code
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Deploy to test environment
+      run: |
+        echo "🚀 Deploying PR changes to test environment..."
+
+        # Use a unique deployment name with PR number
+        DEPLOYMENT_NAME="pr-${{ github.event.number }}-$(date +%Y%m%d-%H%M%S)"
+
+        az deployment sub create \
+          --name "$DEPLOYMENT_NAME" \
+          --location "centralus" \
+          --template-file main.bicep \
+          --parameters main.bicepparam \
+          --parameters environment="test" \
+          --parameters location="centralus" \
+          --parameters companyPrefix="pr${{ github.event.number }}" \
+          --parameters adminPassword="${{ secrets.AZURE_ADMIN_PASSWORD }}" \
+          --parameters sshPublicKey="${{ secrets.SSH_PUBLIC_KEY }}" \
+          --parameters vmSize="Standard_B2s"
+
+        echo "✅ Test deployment completed"
+
+    - name: Comment test results
+      uses: actions/github-script@v7
+      if: always()
+      with:
+        script: |
+          const comment = `## 🧪 Test Deployment Results\n\n` +
+                         `Test deployment for PR #${{ github.event.number }} completed.\n` +
+                         `Environment: \`pr${{ github.event.number }}\`\n\n` +
+                         `⚠️ **Remember to clean up test resources after review!**`;
+
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });

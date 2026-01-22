@@ -1,0 +1,69 @@
+# Bicep compilation outputs
+*.json
+
+# Azure CLI outputs
+.azure/
+
+# VS Code settings
+.vscode/
+*.code-workspace
+
+# Environment files
+.env
+.env.*
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Windows
+Desktop.ini
+
+# IDE files
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Backup files
+*.bak
+*.backup
+
+# Azure Resource Manager deployment outputs
+deploymentOutput.json
+
+# Bicep cache
+.bicep/
+
+# Local deployment scripts with secrets
+deploy-with-secrets.sh
+local-deploy.sh
+
+# GitHub Actions
+.github/workflows/*.log
+.github/workflows/test-*
+.github/workflows/pr-*-temp.yml
+
+# GitHub Actions cache and artifacts
+.github/.deploy-cache/
+.github/artifacts/
+
+# Local testing files for workflows
+test-deployment.json
+validation-errors*.txt
+cleanup-report.txt

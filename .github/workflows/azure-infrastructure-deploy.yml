@@ -1,0 +1,262 @@
+name: Deploy Azure Infrastructure
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**.bicep'
+      - '**.bicepparam'
+      - 'deploy.sh'
+      - '.github/workflows/azure-infrastructure-deploy.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - test
+          - prod
+      location:
+        description: 'Azure region'
+        required: true
+        default: 'centralus'
+        type: choice
+        options:
+          - centralus
+          - eastus
+          - eastus2
+          - westus2
+          - westeurope
+          - northeurope
+      companyPrefix:
+        description: 'Company prefix for naming'
+        required: true
+        default: 'tmb'
+        type: string
+      vmSize:
+        description: 'VM size for all VMs'
+        required: true
+        default: 'Standard_B2s'
+        type: choice
+        options:
+          - Standard_B2s
+          - Standard_B4ms
+          - Standard_D2s_v3
+          - Standard_D4s_v3
+          - Standard_F4s_v2
+      adminPublicIPAddress:
+        description: 'Admin public IP for RDP access (optional)'
+        required: false
+        type: string
+
+env:
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+permissions:
+  contents: read
+  id-token: write  # For OIDC authentication (alternative to client secret)
+
+jobs:
+  validate:
+    name: Validate Bicep Templates
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      location: ${{ steps.set-env.outputs.location }}
+      companyPrefix: ${{ steps.set-env.outputs.companyPrefix }}
+      vmSize: ${{ steps.set-env.outputs.vmSize }}
+      adminPublicIPAddress: ${{ steps.set-env.outputs.adminPublicIPAddress }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set environment variables
+      id: set-env
+      run: |
+        # Set environment based on input or default to 'prod' for main branch
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          echo "location=${{ github.event.inputs.location }}" >> $GITHUB_OUTPUT
+          echo "companyPrefix=${{ github.event.inputs.companyPrefix }}" >> $GITHUB_OUTPUT
+          echo "vmSize=${{ github.event.inputs.vmSize }}" >> $GITHUB_OUTPUT
+          echo "adminPublicIPAddress=${{ github.event.inputs.adminPublicIPAddress }}" >> $GITHUB_OUTPUT
+        else
+          echo "environment=prod" >> $GITHUB_OUTPUT
+          echo "location=centralus" >> $GITHUB_OUTPUT
+          echo "companyPrefix=tmb" >> $GITHUB_OUTPUT
+          echo "vmSize=Standard_B2s" >> $GITHUB_OUTPUT
+          echo "adminPublicIPAddress=" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        # Alternative: Use OIDC authentication
+        # client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        # tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        # subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Install Azure CLI Bicep extension
+      run: az bicep install
+
+    - name: Validate Bicep templates
+      run: |
+        echo "🔍 Validating main Bicep template..."
+        az bicep build --file main.bicep
+
+        echo "🔍 Validating all Bicep modules..."
+        for module in modules/*.bicep; do
+          echo "Validating $module..."
+          az bicep build --file "$module"
+        done
+
+    - name: Lint Bicep templates
+      run: |
+        echo "🔍 Linting Bicep templates..."
+        az bicep build --file main.bicep --stdout > /dev/null
+
+        # Check for common issues
+        echo "🔍 Checking for potential issues..."
+        if grep -r "hardcoded\|TODO\|FIXME" *.bicep modules/*.bicep; then
+          echo "⚠️ Found hardcoded values or TODOs in templates"
+        fi
+
+    - name: Validate deployment (What-If)
+      run: |
+        echo "🔍 Running deployment validation (What-If analysis)..."
+        az deployment sub what-if \
+          --location "${{ steps.set-env.outputs.location }}" \
+          --template-file main.bicep \
+          --parameters main.bicepparam \
+          --parameters environment="${{ steps.set-env.outputs.environment }}" \
+          --parameters location="${{ steps.set-env.outputs.location }}" \
+          --parameters companyPrefix="${{ steps.set-env.outputs.companyPrefix }}" \
+          --parameters adminPassword="${{ secrets.AZURE_ADMIN_PASSWORD }}" \
+          --parameters sshPublicKey="${{ secrets.SSH_PUBLIC_KEY }}" \
+          --parameters vmSize="${{ steps.set-env.outputs.vmSize }}" \
+          --parameters adminPublicIPAddress="${{ steps.set-env.outputs.adminPublicIPAddress }}"
+
+  deploy:
+    name: Deploy to Azure
+    runs-on: ubuntu-latest
+    needs: validate
+    environment: ${{ needs.validate.outputs.environment }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Install Azure CLI Bicep extension
+      run: az bicep install
+
+    - name: Set deployment variables
+      id: vars
+      run: |
+        DEPLOYMENT_NAME="github-deploy-$(date +%Y%m%d-%H%M%S)"
+        echo "deploymentName=$DEPLOYMENT_NAME" >> $GITHUB_OUTPUT
+        echo "🚀 Deployment name: $DEPLOYMENT_NAME"
+
+    - name: Deploy Azure Infrastructure
+      id: deploy
+      run: |
+        echo "🚀 Starting Azure infrastructure deployment..."
+        echo "Environment: ${{ needs.validate.outputs.environment }}"
+        echo "Location: ${{ needs.validate.outputs.location }}"
+        echo "Company Prefix: ${{ needs.validate.outputs.companyPrefix }}"
+        echo "VM Size: ${{ needs.validate.outputs.vmSize }}"
+
+        # Deploy using Azure CLI
+        DEPLOYMENT_OUTPUT=$(az deployment sub create \
+          --name "${{ steps.vars.outputs.deploymentName }}" \
+          --location "${{ needs.validate.outputs.location }}" \
+          --template-file main.bicep \
+          --parameters main.bicepparam \
+          --parameters environment="${{ needs.validate.outputs.environment }}" \
+          --parameters location="${{ needs.validate.outputs.location }}" \
+          --parameters companyPrefix="${{ needs.validate.outputs.companyPrefix }}" \
+          --parameters adminPassword="${{ secrets.AZURE_ADMIN_PASSWORD }}" \
+          --parameters sshPublicKey="${{ secrets.SSH_PUBLIC_KEY }}" \
+          --parameters vmSize="${{ needs.validate.outputs.vmSize }}" \
+          --parameters adminPublicIPAddress="${{ needs.validate.outputs.adminPublicIPAddress }}" \
+          --output json)
+
+        echo "✅ Deployment completed successfully!"
+
+        # Parse and display outputs
+        echo "deployment_output<<EOF" >> $GITHUB_OUTPUT
+        echo "$DEPLOYMENT_OUTPUT" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Display Deployment Results
+      run: |
+        echo "## 🎉 Deployment Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Environment:** ${{ needs.validate.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Location:** ${{ needs.validate.outputs.location }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Company Prefix:** ${{ needs.validate.outputs.companyPrefix }}" >> $GITHUB_STEP_SUMMARY
+        echo "**VM Size:** ${{ needs.validate.outputs.vmSize }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Deployment Name:** ${{ steps.vars.outputs.deploymentName }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Extract resource group names from deployment output
+        echo "### 📦 Created Resource Groups" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo '${{ steps.deploy.outputs.deployment_output }}' | jq -r '.properties.outputs.resourceGroups.value | to_entries[] | "- \(.key): \(.value)"' >> $GITHUB_STEP_SUMMARY || echo "- Resource groups created successfully" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+    - name: Run post-deployment verification
+      run: |
+        echo "🔍 Running post-deployment verification..."
+
+        # Verify resource groups exist
+        RG_SHARED="rg-${{ needs.validate.outputs.companyPrefix }}-${{ needs.validate.outputs.environment }}-shared-${{ needs.validate.outputs.location }}"
+        RG_VNETA="rg-${{ needs.validate.outputs.companyPrefix }}-${{ needs.validate.outputs.environment }}-vneta-${{ needs.validate.outputs.location }}"
+        RG_VNETB="rg-${{ needs.validate.outputs.companyPrefix }}-${{ needs.validate.outputs.environment }}-vnetb-${{ needs.validate.outputs.location }}"
+
+        echo "Checking resource groups..."
+        az group show --name "$RG_SHARED" --output table
+        az group show --name "$RG_VNETA" --output table
+        az group show --name "$RG_VNETB" --output table
+
+        echo "Checking VNet peering status..."
+        az network vnet peering list --resource-group "$RG_VNETA" --vnet-name "vnet-${{ needs.validate.outputs.companyPrefix }}-${{ needs.validate.outputs.environment }}-vneta" --output table
+        az network vnet peering list --resource-group "$RG_VNETB" --vnet-name "vnet-${{ needs.validate.outputs.companyPrefix }}-${{ needs.validate.outputs.environment }}-vnetb" --output table
+
+        echo "✅ Post-deployment verification completed!"
+
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [validate, deploy]
+    if: always()
+
+    steps:
+    - name: Notify Success
+      if: needs.deploy.result == 'success'
+      run: |
+        echo "✅ Azure infrastructure deployment succeeded!"
+        echo "Environment: ${{ needs.validate.outputs.environment }}"
+        echo "Location: ${{ needs.validate.outputs.location }}"
+        # Add webhook notification here if needed
+
+    - name: Notify Failure
+      if: needs.deploy.result == 'failure'
+      run: |
+        echo "❌ Azure infrastructure deployment failed!"
+        echo "Check the deployment logs for details."
+        # Add webhook notification here if needed
+        exit 1

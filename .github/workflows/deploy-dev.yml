@@ -1,0 +1,108 @@
+name: Deploy to Development
+
+on:
+  push:
+    branches:
+      - develop
+    paths:
+      - '**.bicep'
+      - '**.bicepparam'
+      - 'deploy.sh'
+  workflow_dispatch:
+    inputs:
+      companyPrefix:
+        description: 'Company prefix for naming'
+        required: true
+        default: 'dev-tmb'
+        type: string
+      location:
+        description: 'Azure region'
+        required: true
+        default: 'centralus'
+        type: choice
+        options:
+          - centralus
+          - eastus
+          - eastus2
+          - westus2
+
+env:
+  ENVIRONMENT: dev
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+jobs:
+  deploy-dev:
+    name: Deploy Development Environment
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set deployment variables
+      id: vars
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          echo "companyPrefix=${{ github.event.inputs.companyPrefix }}" >> $GITHUB_OUTPUT
+          echo "location=${{ github.event.inputs.location }}" >> $GITHUB_OUTPUT
+        else
+          echo "companyPrefix=dev-tmb" >> $GITHUB_OUTPUT
+          echo "location=centralus" >> $GITHUB_OUTPUT
+        fi
+        echo "deploymentName=dev-deploy-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Install Azure CLI Bicep extension
+      run: az bicep install
+
+    - name: Deploy to Development
+      run: |
+        echo "🚀 Deploying to Development environment..."
+        echo "Company Prefix: ${{ steps.vars.outputs.companyPrefix }}"
+        echo "Location: ${{ steps.vars.outputs.location }}"
+
+        az deployment sub create \
+          --name "${{ steps.vars.outputs.deploymentName }}" \
+          --location "${{ steps.vars.outputs.location }}" \
+          --template-file main.bicep \
+          --parameters main.bicepparam \
+          --parameters environment="dev" \
+          --parameters location="${{ steps.vars.outputs.location }}" \
+          --parameters companyPrefix="${{ steps.vars.outputs.companyPrefix }}" \
+          --parameters adminPassword="${{ secrets.AZURE_ADMIN_PASSWORD }}" \
+          --parameters sshPublicKey="${{ secrets.SSH_PUBLIC_KEY }}" \
+          --parameters vmSize="Standard_B2s" \
+          --parameters adminPublicIPAddress=""
+
+        echo "✅ Development deployment completed!"
+
+    - name: Verify deployment
+      run: |
+        echo "🔍 Verifying development deployment..."
+        RG_PREFIX="rg-${{ steps.vars.outputs.companyPrefix }}-dev-"
+
+        # List all resource groups created
+        az group list --query "[?starts_with(name, '$RG_PREFIX')].{Name:name, Location:location, ProvisioningState:properties.provisioningState}" --output table
+
+    - name: Create deployment summary
+      run: |
+        echo "## 🎉 Development Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Environment:** Development" >> $GITHUB_STEP_SUMMARY
+        echo "**Company Prefix:** ${{ steps.vars.outputs.companyPrefix }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Location:** ${{ steps.vars.outputs.location }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Deployment Name:** ${{ steps.vars.outputs.deploymentName }}" >> $GITHUB_STEP_SUMMARY
+        echo "**VM Size:** Standard_B2s (cost-optimized for dev)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📦 Resource Groups Created" >> $GITHUB_STEP_SUMMARY
+        echo "- Shared: \`rg-${{ steps.vars.outputs.companyPrefix }}-dev-shared-${{ steps.vars.outputs.location }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- VNet A: \`rg-${{ steps.vars.outputs.companyPrefix }}-dev-vneta-${{ steps.vars.outputs.location }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- VNet B: \`rg-${{ steps.vars.outputs.companyPrefix }}-dev-vnetb-${{ steps.vars.outputs.location }}\`" >> $GITHUB_STEP_SUMMARY
